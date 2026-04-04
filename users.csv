@@ -1,0 +1,5 @@
+name,email,site_role,auth_setting,group1,group2
+viewer1@example.com,viewer1@example.com,Viewer,ServerDefault,Sales Team,
+explorer1@example.com,explorer1@example.com,Explorer,SAML,Sales Team,Marketing Team
+user3@example.com,user3@example.com,Unlicensed,ServerDefault,,
+user4@example.com,user4@example.com,Unlicensed,OpenID,Marketing Team,
