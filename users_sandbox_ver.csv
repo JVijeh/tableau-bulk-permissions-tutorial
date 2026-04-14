@@ -1,0 +1,5 @@
+name,email,site_role,auth_setting,group1,group2
+ddqtest001@datadevdiary.com,ddqtest001@datadevdiary.com,Unlicensed,ServerDefault,Sales Team,
+ddqtest002@datadevdiary.com,ddqtest002@datadevdiary.com,Unlicensed,ServerDefault,Sales Team,Marketing Team
+ddqtest003@datadevdiary.com,ddqtest003@datadevdiary.com,Unlicensed,ServerDefault,,
+ddqtest004@datadevdiary.com,ddqtest004@datadevdiary.com,Unlicensed,ServerDefault,Marketing Team,
