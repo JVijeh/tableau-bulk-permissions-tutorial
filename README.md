@@ -43,6 +43,22 @@ tableau-bulk-permissions-tutorial/
 
 ---
 
+## Developer Sandbox Limitations
+
+If you are running this script against a **free Tableau Cloud developer sandbox**, there are a few important differences from a paid site to be aware of:
+
+| Limitation | Detail |
+|---|---|
+| `bulk_add` not supported | The `UserImport` background job is not available on dev sandboxes. The script has been built to detect this automatically and falls back to adding users one at a time using `server.users.add()`. The end result is the same — all users get added. |
+| `email` and `auth_setting` cause errors | Setting these fields on a `UserItem` triggers an identity provider sync that the sandbox cannot complete (`400003: Failed to sync link user`). The fallback uses only `name` and `site_role`, which are the fields proven to work. |
+| `SAML` and `OpenID` auth settings | These require identity providers configured on the site. Use `ServerDefault` on a sandbox. |
+| License limits | Only 1 Viewer and 1 Explorer are supported. Set additional test users to `Unlicensed`. |
+| `example.com` domain | Tableau Cloud rejects this reserved domain for user creation. Use a real or plausible domain instead. |
+
+On a **paid Tableau Cloud site or Tableau Server**, all of these limitations should go away — `bulk_add` runs as a proper background job, and `email`, `auth_setting`, `SAML`/`OpenID` all work as documented.
+
+---
+
 ## Installation (two possible options)
 
 ### Using uv
@@ -105,6 +121,8 @@ A few things worth noting in this example:
 - `user3` has no group assignments — both group columns are blank, and the script skips the group step for that user
 - `explorer1` authenticates via SAML and `user4` via OpenID — mixed identity providers in the same CSV are supported
 
+> **Sandbox users:** Replace `example.com` with a real domain (I chose to use '@datadevdiary.com' for example), set all `site_role` values to `Unlicensed`, and use `ServerDefault` for all `auth_setting` values. See the [Developer Sandbox Limitations](#developer-sandbox-limitations) section above.
+
 ---
 
 ## How to Run
@@ -112,6 +130,8 @@ A few things worth noting in this example:
 ```bash
 python bulk_add_users.py
 ```
+
+### On a paid Tableau Cloud site or Tableau Server
 
 You should see output similar to:
 
@@ -123,7 +143,7 @@ Job finished with status: Success
 
 Retrieving user IDs for newly added users...
 
-Successfully added users:
+Successfully bulk added users:
   viewer1@example.com: 9f3a1b2c-...
   explorer1@example.com: 4d7e8f1a-...
   user3@example.com: 2c5b9d3e-...
@@ -142,6 +162,42 @@ Processing group: 'Marketing Team'
   Added 'user4@example.com' to 'Marketing Team'
 ```
 
+### On a developer sandbox
+
+The script detects that `bulk_add` is not supported and falls back automatically:
+
+```
+Submitting bulk add request for 4 user(s)...
+Job submitted. Job ID: a1b2c3d4-e5f6-...
+Waiting for job to complete...
+
+Note: bulk_add is not supported on this Tableau site.
+This is expected on developer sandboxes — falling back to individual adds.
+
+  Added: ddqtest001@datadevdiary.com (ID: d8ff6664-..., role: Unlicensed)
+  Added: ddqtest002@datadevdiary.com (ID: ed02a79a-..., role: Unlicensed)
+  Added: ddqtest003@datadevdiary.com (ID: 999fea3f-..., role: Unlicensed)
+  Added: ddqtest004@datadevdiary.com (ID: b90813f5-..., role: Unlicensed)
+
+Retrieving user IDs for newly added users...
+
+Successfully added users (via individual adds):
+  ddqtest001@datadevdiary.com: d8ff6664-...
+  ...
+
+Assigning users to groups...
+
+Processing group: 'Sales Team'
+  Group 'Sales Team' not found. Creating it...
+  Added 'ddqtest001@datadevdiary.com' to 'Sales Team'
+  Added 'ddqtest002@datadevdiary.com' to 'Sales Team'
+
+Processing group: 'Marketing Team'
+  Group 'Marketing Team' not found. Creating it...
+  Added 'ddqtest002@datadevdiary.com' to 'Marketing Team'
+  Added 'ddqtest004@datadevdiary.com' to 'Marketing Team'
+```
+
 ---
 
 ## The Code
@@ -150,6 +206,7 @@ Processing group: 'Marketing Team'
 import csv
 import os
 import tableauserverclient as TSC
+from tableauserverclient.server.endpoint.exceptions import JobFailedException
 from dotenv import load_dotenv
 
 # Load credentials from .env file
@@ -223,8 +280,20 @@ def bulk_add_and_wait(server, users):
     Submits a bulk add request to Tableau and waits for it to finish.
 
     bulk_add() returns a background job — Tableau processes user creation
-    once compelete. wait_for_job() handles polling for you don't have to
+    once complete. wait_for_job() handles polling so you don't have to
     manually check the status in a loop.
+
+    Returns a tuple: (success: bool, used_fallback: bool)
+      - success       : True if users were added successfully
+      - used_fallback : True if we fell back to individual adds
+
+    Note on developer sandboxes:
+    The bulk_add endpoint (UserImport background job) is not supported on
+    Tableau's free developer sandbox. If the job fails immediately with no
+    started_at timestamp, this function falls back to adding users one at a
+    time using the standard single-user endpoint. The result is the same —
+    all users get added — but without the async background job pattern.
+    On a paid Tableau Cloud site or Tableau Server, bulk_add runs as designed.
     """
     print(f"Submitting bulk add request for {len(users)} user(s)...")
 
@@ -232,10 +301,65 @@ def bulk_add_and_wait(server, users):
     print(f"Job submitted. Job ID: {job.id}")
     print("Waiting for job to complete...")
 
-    completed_job = server.jobs.wait_for_job(job)
-    print(f"Job finished with status: {completed_job.status}")
+    try:
+        completed_job = server.jobs.wait_for_job(job)
+        print(f"Job finished with status: {completed_job.status}")
+        return True, False
 
-    return completed_job
+    except JobFailedException:
+        # Check whether the job never started — a reliable signal that
+        # the bulk_add endpoint is not supported on this site/plan.
+        failed_job = server.jobs.get_by_id(job.id)
+
+        if failed_job._started_at is None:
+            print("\nNote: bulk_add is not supported on this Tableau site.")
+            print("This is expected on developer sandboxes — falling back to individual adds.")
+            success = _individual_add_fallback(server, users)
+            return success, True
+        else:
+            # The job started but failed for another reason — surface what we know
+            print(f"\nJob failed after starting.")
+            print(f"  Finish code : {failed_job._finish_code}")
+            print(f"  Notes       : {failed_job._notes}")
+            print("Check Admin > Background Tasks in Tableau Cloud for additional detail.")
+            return False, False
+
+
+def _individual_add_fallback(server, users):
+    """
+    Adds users one at a time using the standard single-user endpoint.
+    Used automatically when bulk_add is not supported on the current site.
+
+    This produces the same end result as bulk_add — all users are added —
+    but does so synchronously without a background job.
+
+    Note on email and auth_setting:
+    On Tableau Cloud developer sandboxes, setting email or auth_setting on a
+    UserItem triggers an identity provider sync that the sandbox cannot complete,
+    causing a 400003 "Failed to sync link user" error. The fallback therefore
+    uses only name and site_role — the minimal fields proven to work on sandboxes.
+    On a full Tableau Cloud site with identity providers configured, the original
+    UserItem (with email and auth_setting) can be passed directly.
+    """
+    print()
+    all_succeeded = True
+
+    for user in users:
+        try:
+            # Build a minimal UserItem using only the fields that work on sandboxes.
+            # A full Tableau Cloud site with IdP configured can use the original
+            # user object directly — swap `minimal_user` for `user` in that case.
+            minimal_user = TSC.UserItem(
+                name=user.name,
+                site_role=user.site_role
+            )
+            created = server.users.add(minimal_user)
+            print(f"  Added: {created.name} (ID: {created.id}, role: {created.site_role})")
+        except Exception as e:
+            print(f"  Failed to add {user.name}: {e}")
+            all_succeeded = False
+
+    return all_succeeded
 
 
 def get_added_user_ids(server, user_names):
@@ -302,78 +426,6 @@ def assign_users_to_groups(server, group_assignments, user_id_map):
 
         for user_name in user_names:
             if user_name in user_id_map:
-                # Add the user to the group using their Tableau user ID
-                server.groups.add_user(group, user_id_map[user_name])
-                print(f"  Added '{user_name}' to '{group_name}'")
-            else:
-                # This shouldn't happen if the bulk add is successful, but it is 
-                # worth flagging
-                print(f"  Warning: '{user_name}' not found in user ID map. Therefore skip.")
-
-
-# --- Main Script ---
-
-# Set up authentication using a Personal Access Token (PAT)
-# PATs are preferred over username/password for automation
-tableau_auth = TSC.PersonalAccessTokenAuth(
-    token_name=PAT_NAME,
-    personal_access_token=PAT_VALUE,
-    site_id=SITE_ID
-)
-server = TSC.Server(TABLEAU_SERVER_URL, use_server_version=True)
-
-# Load users and group assignments from the CSV file
-# The function returns both at once as a tuple
-users_to_add, group_assignments = load_users_from_csv("users.csv")
-
-# Sign in, run the workflow, then sign out automatically when the block ends
-with server.auth.sign_in(tableau_auth):
-
-    # Step 1: Bulk add all users and wait for the background job to finish
-    completed_job = bulk_add_and_wait(server, users_to_add)
-
-    if completed_job.status == "Success":
-
-        # Step 2: Retrieve the Tableau-assigned IDs for the newly added users
-        added_names = [user.name for user in users_to_add]
-        user_ids = get_added_user_ids(server, added_names)
-
-        print("\nSuccessfully added users:")
-        for name, uid in user_ids.items():
-            print(f"  {name}: {uid}")
-
-        # Step 3: Assign users to groups (if any group columns were in the CSV)
-        assign_users_to_groups(server, group_assignments, user_ids)
-
-    else:
-        print("The bulk add job did not complete successfully. Be sure to check your Tableau site for details.")
-
-```
-
----
-
-## Key Concepts
-
-### Why did you use `bulk_add` instead of individual add requests?
-Typically the approach is calling the Add User endpoint once per user in a loop. For large batches however, this is slow and puts unnecessary load on the server. The `bulk_add` method introduced in TSC v0.40 bundles all users into a single request, which Tableau processes as a background job.
-
-### What is an async background job?
-When you call `server.users.bulk_add()`, Tableau doesn't process the users immediately — it queues the work as a background job and returns a job ID. The `server.jobs.wait_for_job()` method takes care of querying Tableau until that job finishes, to avoid having to write a manual retry loop.
-
-### What is `TSC.Pager`?
-Tableau's API returns results in pages, meaning if you have more users or groups than the default page size, you'd only be able to see the first batch. `TSC.Pager` wraps any list endpoint and automatically fetches all pages for you. That way you always get the complete result set without having to write additional code.
-
-### Why does `load_users_from_csv` return two items?
-The function returns a tuple — `(users, group_assignments)`. This lets you collect everything you need from the CSV in a single run, without reading the file twice. The `users` list goes straight into the bulk add call; `group_assignments` is held until after the job completes and we have user IDs to work with.
-
-### Why does group assignment happen after the bulk add?
-Users cannot be assigned to groups until they exist on the site — and they don't exist until the background job finishes. That's why group assignment is always the last step in the process.
-
-### What happens if a user does not have a group?
-Nothing — and that's on purpose. If all of a user's group columns are blank, they simply won't appear in `group_assignments` and the group step skips them completely.
-
-### What happens if a group doesn't exist yet?
-The `get_or_create_group` function goes through all groups on the site looking for a name match. If it doesn't find one, it creates the group automatically before adding users to it. This means you don't have to create groups ahead of time in Tableau before running the script.
 
 ### What is `auth_setting` and when does it matter?
 The `auth_setting` controls which identity provider (IdP) authenticates a user. The three valid values are:
@@ -401,4 +453,78 @@ If left blank in the CSV, the script defaults to `ServerDefault`. Mixed values i
 - [Tableau REST API – Add User to Site](https://help.tableau.com/current/api/rest_api/en-us/REST/rest_api_ref_users_and_groups.htm#add_user_to_site)
 - [Tableau REST API – Add User to Group](https://help.tableau.com/current/api/rest_api/en-us/REST/rest_api_ref_users_and_groups.htm#add_user_to_group)
 - [Tableau Server Client for Python (PyPI)](https://pypi.org/project/tableauserverclient/)
-- [Postman Collection for Tableau REST APIs](https://www.postman.com/salesforce-developers/salesforce-developers/collection/x06mp2m/tableau-apis)
+- [Postman Collection for Tableau REST APIs](https://www.postman.com/salesforce-developers/salesforce-developers/collection/x06mp2m/tableau-apis)                # Add the user to the group using their Tableau user ID
+                server.groups.add_user(group, user_id_map[user_name])
+                print(f"  Added '{user_name}' to '{group_name}'")
+            else:
+                # This shouldn't happen if the bulk add is successful, but it is
+                # worth flagging
+                print(f"  Warning: '{user_name}' not found in user ID map. Therefore skip.")
+
+
+# --- Main Script ---
+
+# Set up authentication using a Personal Access Token (PAT)
+# PATs are preferred over username/password for automation
+tableau_auth = TSC.PersonalAccessTokenAuth(
+    token_name=PAT_NAME,
+    personal_access_token=PAT_VALUE,
+    site_id=SITE_ID
+)
+server = TSC.Server(TABLEAU_SERVER_URL, use_server_version=True)
+
+# Load users and group assignments from the CSV file
+# The function returns both at once as a tuple
+users_to_add, group_assignments = load_users_from_csv("users.csv")
+
+# Sign in, run the workflow, then sign out automatically when the block ends
+with server.auth.sign_in(tableau_auth):
+
+    # Step 1: Attempt bulk add — falls back to individual adds if not supported
+    success, used_fallback = bulk_add_and_wait(server, users_to_add)
+
+    if success:
+
+        # Step 2: Retrieve the Tableau-assigned IDs for the newly added users
+        added_names = [user.name for user in users_to_add]
+        user_ids = get_added_user_ids(server, added_names)
+
+        if not used_fallback:
+            print("\nSuccessfully bulk added users:")
+        else:
+            print("\nSuccessfully added users (via individual adds):")
+
+        for name, uid in user_ids.items():
+            print(f"  {name}: {uid}")
+
+        # Step 3: Assign users to groups (if any group columns were in the CSV)
+        assign_users_to_groups(server, group_assignments, user_ids)
+
+    else:
+        print("The bulk add job did not complete successfully. Be sure to check your Tableau site for details.")
+```
+
+---
+
+## Key Concepts
+
+### Why did you use `bulk_add` instead of individual add requests?
+Typically the approach is calling the Add User endpoint once per user in a loop. For large batches however, this is slow and puts unnecessary load on the server. The `bulk_add` method introduced in TSC v0.40 bundles all users into a single request, which Tableau processes as a background job.
+
+### What is an async background job?
+When you call `server.users.bulk_add()`, Tableau doesn't process the users immediately — it queues the work as a background job and returns a job ID. The `server.jobs.wait_for_job()` method takes care of querying Tableau until that job finishes, to avoid having to write a manual retry loop.
+
+### What is `TSC.Pager`?
+Tableau's API returns results in pages, meaning if you have more users or groups than the default page size, you'd only be able to see the first batch. `TSC.Pager` wraps any list endpoint and automatically fetches all pages for you. That way you always get the complete result set without having to write additional code.
+
+### Why does `load_users_from_csv` return two items?
+The function returns a tuple — `(users, group_assignments)`. This lets you collect everything you need from the CSV in a single run, without reading the file twice. The `users` list goes straight into the bulk add call; `group_assignments` is held until after the job completes and we have user IDs to work with.
+
+### Why does group assignment happen after the bulk add?
+Users cannot be assigned to groups until they exist on the site — and they don't exist until the background job finishes. That's why group assignment is always the last step in the process.
+
+### What happens if a user does not have a group?
+Nothing — and that's on purpose. If all of a user's group columns are blank, they simply won't appear in `group_assignments` and the group step skips them completely.
+
+### What happens if a group doesn't exist yet?
+The `get_or_create_group` function goes through all groups on the site looking for a name match. If it doesn't find one, it creates the group automatically before adding users to it. This means you don't have to create groups ahead of time in Tableau before running the script.
